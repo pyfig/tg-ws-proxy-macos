@@ -4,6 +4,7 @@ import json
 import logging
 import logging.handlers
 import os
+import plistlib
 import psutil
 import subprocess
 import sys
@@ -38,12 +39,15 @@ LOG_FILE = APP_DIR / "proxy.log"
 FIRST_RUN_MARKER = APP_DIR / ".first_run_done"
 IPV6_WARN_MARKER = APP_DIR / ".ipv6_warned"
 MENUBAR_ICON_PATH = APP_DIR / "menubar_icon.png"
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+AUTOSTART_LABEL = "com.tgwsproxy.app.autostart"
 
 DEFAULT_CONFIG = {
     "port": 1080,
     "host": "127.0.0.1",
     "dc_ip": ["2:149.154.167.220", "4:149.154.167.220"],
     "verbose": False,
+    "autostart": False,
     "log_max_mb": 5,
     "buf_kb": 256,
     "pool_size": 4,
@@ -181,6 +185,91 @@ def setup_logging(verbose: bool = False, log_max_mb: float = 5):
             "%(asctime)s  %(levelname)-5s  %(message)s",
             datefmt="%H:%M:%S"))
         root.addHandler(ch)
+
+# Autostartup via LaunchAgent
+
+def _app_bundle_path() -> Optional[Path]:
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        bundle_path = Path(sys.executable).resolve().parents[2]
+    except Exception:
+        return None
+    if bundle_path.suffix != ".app" or not bundle_path.exists():
+        return None
+    return bundle_path
+
+
+def _supports_autostart() -> bool:
+    return _app_bundle_path() is not None
+
+
+def _autostart_plist_path() -> Path:
+    return LAUNCH_AGENTS_DIR / f"{AUTOSTART_LABEL}.plist"
+
+
+def _autostart_program_arguments() -> list[str]:
+    bundle_path = _app_bundle_path()
+    if bundle_path is None:
+        raise RuntimeError("Autostart is only supported for frozen .app builds.")
+    return ["/usr/bin/open", str(bundle_path)]
+
+
+def is_autostart_enabled() -> bool:
+    if not _supports_autostart():
+        return False
+
+    plist_path = _autostart_plist_path()
+    if not plist_path.exists():
+        return False
+
+    try:
+        with open(plist_path, "rb") as f:
+            data = plistlib.load(f)
+    except Exception as exc:
+        log.warning("Failed to read autostart plist: %s", exc)
+        return False
+
+    return (
+        data.get("Label") == AUTOSTART_LABEL
+        and data.get("ProgramArguments") == _autostart_program_arguments()
+    )
+
+
+def set_autostart_enabled(enabled: bool) -> None:
+    if not _supports_autostart():
+        return
+
+    plist_path = _autostart_plist_path()
+    try:
+        if enabled:
+            LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "Label": AUTOSTART_LABEL,
+                "ProgramArguments": _autostart_program_arguments(),
+                "RunAtLoad": True,
+                "KeepAlive": False,
+                "LimitLoadToSessionType": "Aqua",
+            }
+            with open(plist_path, "wb") as f:
+                plistlib.dump(payload, f, sort_keys=False)
+        else:
+            plist_path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.error("Failed to update autostart LaunchAgent: %s", exc)
+        _show_error(
+            "Не удалось изменить автозапуск.\n\n"
+            "Проверьте права на запись в ~/Library/LaunchAgents.\n\n"
+            f"Ошибка: {exc}"
+        )
+
+
+def _sync_autostart_config(cfg: dict) -> dict:
+    synced_cfg = dict(cfg)
+    synced_cfg["autostart"] = (
+        is_autostart_enabled() if _supports_autostart() else False
+    )
+    return synced_cfg
 
 
 # Menubar icon
@@ -428,6 +517,9 @@ def _on_edit_config(_=None):
 # Settings via native macOS dialogs
 def _edit_config_dialog():
     cfg = load_config()
+    cfg["autostart"] = (
+        is_autostart_enabled() if _supports_autostart() else False
+    )
 
     # Host
     host = _osascript_input(
@@ -501,16 +593,31 @@ def _edit_config_dialog():
                 except ValueError:
                     pass
 
+    supports_autostart = _supports_autostart()
+    autostart = False
+    if supports_autostart:
+        autostart = _ask_yes_no_close("Включить автозапуск при входе в macOS?")
+        if autostart is None:
+            return
+
     new_cfg = {
         "host": host,
         "port": port,
         "dc_ip": dc_lines,
         "verbose": verbose,
+        "autostart": autostart,
         "buf_kb": adv.get("buf_kb", cfg.get("buf_kb", DEFAULT_CONFIG["buf_kb"])),
         "pool_size": adv.get("pool_size", cfg.get("pool_size", DEFAULT_CONFIG["pool_size"])),
         "log_max_mb": adv.get("log_max_mb", cfg.get("log_max_mb", DEFAULT_CONFIG["log_max_mb"])),
     }
     save_config(new_cfg)
+
+    if supports_autostart:
+        set_autostart_enabled(autostart)
+        new_cfg["autostart"] = is_autostart_enabled()
+        if new_cfg["autostart"] != autostart:
+            save_config(new_cfg)
+
     log.info("Config saved: %s", new_cfg)
 
     global _config
@@ -518,8 +625,9 @@ def _edit_config_dialog():
     if _app:
         _app.update_menu_title()
 
-    if _ask_yes_no_close(
-            "Настройки сохранены.\n\nПерезапустить прокси сейчас?"):
+    saved_text = "Настройки сохранены."
+    
+    if _ask_yes_no_close(f"{saved_text}\n\nПерезапустить прокси сейчас?"):
         restart_proxy()
 
 
@@ -639,7 +747,7 @@ class TgWsProxyApp(_TgWsProxyAppBase):
 def run_menubar():
     global _app, _config
 
-    _config = load_config()
+    _config = _sync_autostart_config(load_config())
     save_config(_config)
 
     if LOG_FILE.exists():
